@@ -18,16 +18,6 @@ SYMBOL, SIDE, ENTRY, SL, TP, LOT, REASON, EMOTION = range(8)
 CHECKLIST_START = 8
 CHECKLIST_END = 26
 
-# After checklist
-CHECK_NOTES = CHECKLIST_START + TOTAL_CHECKS
-RESULT = CHECK_NOTES + 1
-PNL = RESULT + 1
-FINAL_MOVE = PNL + 1
-FINAL_RR = FINAL_MOVE + 1
-EXIT_REASON = FINAL_RR + 1
-LESSONS = EXIT_REASON + 1
-BALANCE = LESSONS + 1
-
 CHECKLIST = [
     ("1. LIQUIDITY (4H)", [
         "ناحیه نقدینگی در 4 ساعت گذشته مشخص شد.",
@@ -65,6 +55,16 @@ CHECKLIST = [
 
 CHECK_ITEMS = [(section, q) for section, qs in CHECKLIST for q in qs]
 TOTAL_CHECKS = len(CHECK_ITEMS)
+
+# Conversation states after the checklist
+CHECK_NOTES = CHECKLIST_START + TOTAL_CHECKS
+RESULT = CHECK_NOTES + 1
+PNL = RESULT + 1
+FINAL_MOVE = PNL + 1
+FINAL_RR = FINAL_MOVE + 1
+EXIT_REASON = FINAL_RR + 1
+LESSONS = EXIT_REASON + 1
+BALANCE = LESSONS + 1
 
 def db():
     conn = sqlite3.connect(DB)
