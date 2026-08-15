@@ -18,6 +18,16 @@ SYMBOL, SIDE, ENTRY, SL, TP, LOT, REASON, EMOTION = range(8)
 CHECKLIST_START = 8
 CHECKLIST_END = 26
 
+# After checklist
+CHECK_NOTES = CHECKLIST_START + TOTAL_CHECKS
+RESULT = CHECK_NOTES + 1
+PNL = RESULT + 1
+FINAL_MOVE = PNL + 1
+FINAL_RR = FINAL_MOVE + 1
+EXIT_REASON = FINAL_RR + 1
+LESSONS = EXIT_REASON + 1
+BALANCE = LESSONS + 1
+
 CHECKLIST = [
     ("1. LIQUIDITY (4H)", [
         "ناحیه نقدینگی در 4 ساعت گذشته مشخص شد.",
@@ -56,16 +66,6 @@ CHECKLIST = [
 CHECK_ITEMS = [(section, q) for section, qs in CHECKLIST for q in qs]
 TOTAL_CHECKS = len(CHECK_ITEMS)
 
-# Conversation states after the checklist
-CHECK_NOTES = CHECKLIST_START + TOTAL_CHECKS
-RESULT = CHECK_NOTES + 1
-PNL = RESULT + 1
-FINAL_MOVE = PNL + 1
-FINAL_RR = FINAL_MOVE + 1
-EXIT_REASON = FINAL_RR + 1
-LESSONS = EXIT_REASON + 1
-BALANCE = LESSONS + 1
-
 def db():
     conn = sqlite3.connect(DB)
     conn.execute("""
@@ -77,7 +77,7 @@ def db():
         balance_before REAL, reason TEXT, emotion TEXT,
         checklist TEXT NOT NULL,
         checklist_notes TEXT,
-        result TEXT, pnl REAL, final_move TEXT, final_rr REAL,
+        result TEXT, pnl REAL, final_rr REAL,
         exit_reason TEXT, lessons TEXT,
         screenshot_file_id TEXT
     )
@@ -156,7 +156,7 @@ async def lot(update, context):
 async def reason(update, context):
     context.user_data["reason"] = update.message.text.strip()
     await update.message.reply_text(
-        "8/9 — احساس لحظه ورود؟\n"
+        "8/8 — احساس لحظه ورود؟\n"
         "آرام و منطقی / بی‌حوصله و عجله‌زده / خشمگین / انتقامی"
     )
     return EMOTION
@@ -210,7 +210,7 @@ async def check_notes(update, context):
     return RESULT
 
 async def result(update, context):
-    context.user_data["result"] = update.message.text.strip().upper()
+    context.user_data["result"] = update.message.text.strip()
     await update.message.reply_text("P/L معامله به دلار؟\nمثلاً +12.5 یا -5")
     return PNL
 
@@ -319,9 +319,9 @@ def fetch_rows(user_id, days):
 
 def stats(rows):
     total = len(rows)
-    wins = sum(1 for r in rows if str(r[14]).strip().upper() == "WIN")
-    losses = sum(1 for r in rows if str(r[14]).strip().upper() == "LOSS")
-    be = sum(1 for r in rows if str(r[14]).strip().upper() in ("BE", "BREAK EVEN", "BREAKEVEN"))
+    wins = sum(1 for r in rows if str(r[17]).lower() == "win")
+    losses = sum(1 for r in rows if str(r[17]).lower() == "loss")
+    be = total - wins - losses
     pnl = sum(float(r[15] or 0) for r in rows)
     profit = sum(float(r[15] or 0) for r in rows if float(r[15] or 0) > 0)
     loss = sum(float(r[15] or 0) for r in rows if float(r[15] or 0) < 0)
@@ -387,10 +387,10 @@ def report_text(rows, title):
     high = [r for r in rows if pct(sum(x=="1" for x in r[12].split(",")), TOTAL_CHECKS) >= 80]
     low = [r for r in rows if pct(sum(x=="1" for x in r[12].split(",")), TOTAL_CHECKS) < 80]
     if high:
-        hw = sum(1 for r in high if str(r[14]).strip().upper()=="WIN")
+        hw = sum(1 for r in high if str(r[17]).lower()=="win")
         lines += ["", f"🧠 وقتی چک‌لیست ≥80٪ رعایت شده: {len(high)} معامله | Win Rate {pct(hw,len(high)):.1f}% | P/L {sum(float(r[15] or 0) for r in high):+.2f}$"]
     if low:
-        lw = sum(1 for r in low if str(r[14]).strip().upper()=="WIN")
+        lw = sum(1 for r in low if str(r[17]).lower()=="win")
         lines.append(f"⚠️ وقتی چک‌لیست <80٪ رعایت شده: {len(low)} معامله | Win Rate {pct(lw,len(low)):.1f}% | P/L {sum(float(r[15] or 0) for r in low):+.2f}$")
 
     return "\n".join(lines)
@@ -409,8 +409,8 @@ async def week(update, context):
         worst = min(rows, key=lambda r: float(r[15] or 0))
         await update.message.reply_text(
             "📝 Weekly Review\n\n"
-            f"🏆 بهترین معامله: {best[2]} | {float(best[15] or 0):+.2f}$\n"
-            f"⚠️ بدترین معامله: {worst[2]} | {float(worst[15] or 0):+.2f}$\n\n"
+            f"🏆 بهترین معامله: {best[2]} | {float(best[13]):+.2f}$\n"
+            f"⚠️ بدترین معامله: {worst[2]} | {float(worst[13]):+.2f}$\n\n"
             "برای بررسی عمیق‌تر، /checklist را بزن."
         )
 
@@ -472,24 +472,7 @@ def main():
     app.add_handler(CommandHandler("week", week))
     app.add_handler(CommandHandler("checklist", checklist_report))
     app.add_handler(conv)
-
-    port = int(os.getenv("PORT", "10000"))
-    external_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-    if external_url:
-        webhook_path = "telegram"
-        webhook_url = f"{external_url}/{webhook_path}"
-        print(f"Starting Telegram webhook on 0.0.0.0:{port} -> {webhook_url}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=webhook_path,
-            webhook_url=webhook_url,
-            drop_pending_updates=True,
-        )
-    else:
-        # Local fallback: polling when not running on Render.
-        print("Starting Telegram polling (local mode)")
-        app.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
