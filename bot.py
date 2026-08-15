@@ -2,9 +2,9 @@
 import os
 import sqlite3
 from datetime import datetime, timedelta
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ConversationHandler,
+    Application, CommandHandler, MessageHandler, ConversationHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
 
@@ -17,16 +17,6 @@ SYMBOL, SIDE, ENTRY, SL, TP, LOT, REASON, EMOTION = range(8)
 # Checklist questions
 CHECKLIST_START = 8
 CHECKLIST_END = 26
-
-# After checklist
-CHECK_NOTES = CHECKLIST_START + TOTAL_CHECKS
-RESULT = CHECK_NOTES + 1
-PNL = RESULT + 1
-FINAL_MOVE = PNL + 1
-FINAL_RR = FINAL_MOVE + 1
-EXIT_REASON = FINAL_RR + 1
-LESSONS = EXIT_REASON + 1
-BALANCE = LESSONS + 1
 
 CHECKLIST = [
     ("1. LIQUIDITY (4H)", [
@@ -66,6 +56,16 @@ CHECKLIST = [
 CHECK_ITEMS = [(section, q) for section, qs in CHECKLIST for q in qs]
 TOTAL_CHECKS = len(CHECK_ITEMS)
 
+# Conversation states after the checklist
+CHECK_NOTES = CHECKLIST_START + TOTAL_CHECKS
+RESULT = CHECK_NOTES + 1
+PNL = RESULT + 1
+FINAL_MOVE = PNL + 1
+FINAL_RR = FINAL_MOVE + 1
+EXIT_REASON = FINAL_RR + 1
+LESSONS = EXIT_REASON + 1
+BALANCE = LESSONS + 1
+
 def db():
     conn = sqlite3.connect(DB)
     conn.execute("""
@@ -77,7 +77,7 @@ def db():
         balance_before REAL, reason TEXT, emotion TEXT,
         checklist TEXT NOT NULL,
         checklist_notes TEXT,
-        result TEXT, pnl REAL, final_rr REAL,
+        result TEXT, pnl REAL, final_move TEXT, final_rr REAL,
         exit_reason TEXT, lessons TEXT,
         screenshot_file_id TEXT
     )
@@ -156,7 +156,7 @@ async def lot(update, context):
 async def reason(update, context):
     context.user_data["reason"] = update.message.text.strip()
     await update.message.reply_text(
-        "8/8 — احساس لحظه ورود؟\n"
+        "8/9 — احساس لحظه ورود؟\n"
         "آرام و منطقی / بی‌حوصله و عجله‌زده / خشمگین / انتقامی"
     )
     return EMOTION
@@ -179,28 +179,70 @@ async def balance(update, context):
 async def ask_check(update, context):
     i = context.user_data["check_idx"]
     section, question = CHECK_ITEMS[i]
-    await update.message.reply_text(
-        f"☑️ چک‌لیست {i+1}/{TOTAL_CHECKS}\n"
-        f"📌 {section}\n\n{question}\n\n"
-        "رعایت شده؟  بله / خیر"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🟢 بله", callback_data="check_yes"),
+            InlineKeyboardButton("🔴 خیر", callback_data="check_no"),
+        ]
+    ])
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(
+            f"☑️ چک‌لیست {i+1}/{TOTAL_CHECKS}\n"
+            f"📌 {section}\n\n{question}\n\n"
+            "رعایت شده؟"
+        ),
+        reply_markup=keyboard
     )
 
 async def checklist_answer(update, context):
-    text = update.message.text.strip().lower()
-    if text not in ("بله", "خیر", "yes", "no"):
-        await update.message.reply_text("فقط «بله» یا «خیر» بنویس.")
-        return CHECKLIST_START
+    # Fallback for typed answers.
+    answer = update.message.text.strip().lower()
+    if answer not in ("بله", "خیر", "yes", "no"):
+        await update.message.reply_text("لطفاً فقط گزینه «بله» یا «خیر» را بزن.")
+        return CHECKLIST_START + context.user_data.get("check_idx", 0)
 
-    context.user_data["checks"].append(text in ("بله", "yes"))
+    context.user_data["checks"].append(answer in ("بله", "yes"))
     context.user_data["check_idx"] += 1
+    if context.user_data["check_idx"] < TOTAL_CHECKS:
+        await ask_check(update, context)
+        return CHECKLIST_START + context.user_data["check_idx"]
+
+    score = sum(context.user_data["checks"])
+    await update.message.reply_text(
+        f"✅ چک‌لیست تمام شد. امتیاز: {score}/{TOTAL_CHECKS} "
+        f"({pct(score, TOTAL_CHECKS):.1f}%)\n\n"
+        "اگر برای چک‌لیست توضیحی داری بنویس؛ اگر نداری «ندارم»."
+    )
+    return CHECK_NOTES
+
+async def checklist_button(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data not in ("check_yes", "check_no"):
+        return CHECKLIST_START + context.user_data.get("check_idx", 0)
+
+    context.user_data["checks"].append(query.data == "check_yes")
+    context.user_data["check_idx"] += 1
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
     if context.user_data["check_idx"] < TOTAL_CHECKS:
         await ask_check(update, context)
         return CHECKLIST_START + context.user_data["check_idx"]
 
-    await update.message.reply_text(
-        "✅ چک‌لیست تمام شد.\n\n"
-        "اگر برای چک‌لیست توضیحی داری بنویس؛ اگر نداری «ندارم»."
+    score = sum(context.user_data["checks"])
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(
+            f"✅ چک‌لیست تمام شد. امتیاز: {score}/{TOTAL_CHECKS} "
+            f"({pct(score, TOTAL_CHECKS):.1f}%)\n\n"
+            "اگر برای چک‌لیست توضیحی داری بنویس؛ اگر نداری «ندارم»."
+        )
     )
     return CHECK_NOTES
 
@@ -210,7 +252,7 @@ async def check_notes(update, context):
     return RESULT
 
 async def result(update, context):
-    context.user_data["result"] = update.message.text.strip()
+    context.user_data["result"] = update.message.text.strip().upper()
     await update.message.reply_text("P/L معامله به دلار؟\nمثلاً +12.5 یا -5")
     return PNL
 
@@ -319,9 +361,9 @@ def fetch_rows(user_id, days):
 
 def stats(rows):
     total = len(rows)
-    wins = sum(1 for r in rows if str(r[17]).lower() == "win")
-    losses = sum(1 for r in rows if str(r[17]).lower() == "loss")
-    be = total - wins - losses
+    wins = sum(1 for r in rows if str(r[14]).strip().upper() == "WIN")
+    losses = sum(1 for r in rows if str(r[14]).strip().upper() == "LOSS")
+    be = sum(1 for r in rows if str(r[14]).strip().upper() in ("BE", "BREAK EVEN", "BREAKEVEN"))
     pnl = sum(float(r[15] or 0) for r in rows)
     profit = sum(float(r[15] or 0) for r in rows if float(r[15] or 0) > 0)
     loss = sum(float(r[15] or 0) for r in rows if float(r[15] or 0) < 0)
@@ -387,10 +429,10 @@ def report_text(rows, title):
     high = [r for r in rows if pct(sum(x=="1" for x in r[12].split(",")), TOTAL_CHECKS) >= 80]
     low = [r for r in rows if pct(sum(x=="1" for x in r[12].split(",")), TOTAL_CHECKS) < 80]
     if high:
-        hw = sum(1 for r in high if str(r[17]).lower()=="win")
+        hw = sum(1 for r in high if str(r[14]).strip().upper()=="WIN")
         lines += ["", f"🧠 وقتی چک‌لیست ≥80٪ رعایت شده: {len(high)} معامله | Win Rate {pct(hw,len(high)):.1f}% | P/L {sum(float(r[15] or 0) for r in high):+.2f}$"]
     if low:
-        lw = sum(1 for r in low if str(r[17]).lower()=="win")
+        lw = sum(1 for r in low if str(r[14]).strip().upper()=="WIN")
         lines.append(f"⚠️ وقتی چک‌لیست <80٪ رعایت شده: {len(low)} معامله | Win Rate {pct(lw,len(low)):.1f}% | P/L {sum(float(r[15] or 0) for r in low):+.2f}$")
 
     return "\n".join(lines)
@@ -409,8 +451,8 @@ async def week(update, context):
         worst = min(rows, key=lambda r: float(r[15] or 0))
         await update.message.reply_text(
             "📝 Weekly Review\n\n"
-            f"🏆 بهترین معامله: {best[2]} | {float(best[13]):+.2f}$\n"
-            f"⚠️ بدترین معامله: {worst[2]} | {float(worst[13]):+.2f}$\n\n"
+            f"🏆 بهترین معامله: {best[2]} | {float(best[15] or 0):+.2f}$\n"
+            f"⚠️ بدترین معامله: {worst[2]} | {float(worst[15] or 0):+.2f}$\n\n"
             "برای بررسی عمیق‌تر، /checklist را بزن."
         )
 
@@ -444,7 +486,10 @@ def main():
 
     # Each checklist item gets its own state, but the same handler processes them.
     for i in range(TOTAL_CHECKS):
-        states[CHECKLIST_START+i] = [MessageHandler(filters.TEXT & ~filters.COMMAND, checklist_answer)]
+        states[CHECKLIST_START+i] = [
+            CallbackQueryHandler(checklist_button, pattern="^check_(yes|no)$"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, checklist_answer),
+        ]
 
     states[CHECK_NOTES] = [MessageHandler(filters.TEXT & ~filters.COMMAND, check_notes)]
     states[RESULT] = [MessageHandler(filters.TEXT & ~filters.COMMAND, result)]
@@ -472,7 +517,24 @@ def main():
     app.add_handler(CommandHandler("week", week))
     app.add_handler(CommandHandler("checklist", checklist_report))
     app.add_handler(conv)
-    app.run_polling()
+
+    port = int(os.getenv("PORT", "10000"))
+    external_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if external_url:
+        webhook_path = "telegram"
+        webhook_url = f"{external_url}/{webhook_path}"
+        print(f"Starting Telegram webhook on 0.0.0.0:{port} -> {webhook_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=webhook_path,
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
+        )
+    else:
+        # Local fallback: polling when not running on Render.
+        print("Starting Telegram polling (local mode)")
+        app.run_polling()
 
 if __name__ == "__main__":
     main()
