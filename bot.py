@@ -893,12 +893,16 @@ def main():
         capital_menu
     ))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ تنظیمات$"), settings))
+    # Initial balance entry MUST come before the capital-adjustment handler,
+    # otherwise the numeric amount typed after /start gets swallowed.
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        setup_balance
+    ))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(r"^(?:\d+(?:[\.,]\d+)?|➕ افزایش سرمایه|➖ کاهش سرمایه|📊 سرمایه فعلی|↩️ بازگشت)$"),
         capital_adjustment
     ))
-    # Initial balance entry when explicitly requested.
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, setup_balance))
 
     port = int(os.getenv("PORT","10000"))
     external = os.getenv("RENDER_EXTERNAL_URL","").rstrip("/")
