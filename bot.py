@@ -322,6 +322,34 @@ async def start(update, context):
     )
 
 async def setup_balance(update, context):
+    # This handler also receives numeric capital-adjustment amounts.
+    # Handle adjustment first, otherwise the initial-balance flow works normally.
+    if context.user_data.get("capital_mode"):
+        t = update.message.text.strip()
+        try:
+            amount = float(t.replace(",", "."))
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("فقط یک مبلغ مثبت وارد کن؛ مثلاً 100")
+            return
+        uid = update.effective_user.id
+        typ = context.user_data.pop("capital_mode")
+        conn = db()
+        conn.execute(
+            "INSERT INTO capital_adjustments(user_id,created_at,adjustment_type,amount,note) VALUES(?,?,?,?,?)",
+            (uid, datetime.now().isoformat(timespec="seconds"), typ, amount, None)
+        )
+        conn.commit()
+        conn.close()
+        sign = "افزایش" if typ == "DEPOSIT" else "کاهش"
+        await update.message.reply_text(
+            f"✅ {sign} سرمایه به مبلغ <b>${amount:.2f}</b> ثبت شد.\n"
+            f"🏦 سرمایه فعلی: <b>${current_balance(uid):.2f}</b>",
+            parse_mode="HTML", reply_markup=main_keyboard()
+        )
+        return
+
     if not context.user_data.get("awaiting_initial_balance"):
         return
     try:
@@ -926,7 +954,6 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^⚙️ تنظیمات$"), settings))
     app.add_handler(MessageHandler(filters.Regex("^💰 مدیریت سرمایه$"), capital_menu))
     app.add_handler(MessageHandler(filters.Regex("^(?:➕ افزایش سرمایه|➖ کاهش سرمایه|📊 سرمایه فعلی|📜 تاریخچه|🔙 بازگشت)$"), capital_action))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r"^\d+(?:[\.,]\d+)?$"), capital_action))
     # Initial balance entry when explicitly requested.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, setup_balance))
 
