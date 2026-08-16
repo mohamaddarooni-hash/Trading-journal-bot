@@ -13,15 +13,15 @@ from telegram.ext import (
 
 TOKEN = os.getenv("BOT_TOKEN")
 DB = os.getenv("DB_PATH", "journal.db")
-VERSION = "2026-08-16-pro-v3"
+VERSION = "2026-08-16-pro-v4"
 
 # -------------------- Conversation states --------------------
 BALANCE_SETUP, SYMBOL, OTHER_SYMBOL, SIDE, ENTRY, SL, TP, LOT = range(8)
 CHECKLIST_START = 8
-RESULT = 9
-EXIT_PRICE = 10
-FINAL_MOVE = 11
-SCREENSHOT = 12
+RESULT = CHECKLIST_START + 18
+EXIT_PRICE = RESULT + 1
+FINAL_MOVE = EXIT_PRICE + 1
+SCREENSHOT = FINAL_MOVE + 1
 
 # -------------------- Exact 6-stage checklist --------------------
 CHECKLIST = [
@@ -114,6 +114,9 @@ def db():
 def pct(n, d):
     return 0.0 if not d else n / d * 100.0
 
+def fmt_pct(n, d):
+    return f"{pct(n,d):.1f}%"
+
 def initial_balance(user_id):
     conn = db()
     row = conn.execute(
@@ -137,19 +140,10 @@ def current_balance(user_id):
     if start is None:
         return None
     conn = db()
-    trade_pnl = conn.execute(
-        "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE user_id=?", (user_id,)
-    ).fetchone()[0]
-    adjustments = conn.execute(
-        """SELECT COALESCE(SUM(
-               CASE WHEN adjustment_type='DEPOSIT' THEN amount
-                    WHEN adjustment_type='WITHDRAW' THEN -amount
-                    ELSE 0 END
-             ),0)
-           FROM capital_adjustments WHERE user_id=?""", (user_id,)
-    ).fetchone()[0]
+    row = conn.execute("""SELECT balance_after FROM trades WHERE user_id=? AND balance_after IS NOT NULL ORDER BY id DESC LIMIT 1""", (user_id,)).fetchone()
+    adjustments = conn.execute("""SELECT COALESCE(SUM(CASE WHEN adjustment_type='DEPOSIT' THEN amount WHEN adjustment_type='WITHDRAW' THEN -amount ELSE 0 END),0) FROM capital_adjustments WHERE user_id=?""", (user_id,)).fetchone()[0]
     conn.close()
-    return float(start) + float(trade_pnl or 0) + float(adjustments or 0)
+    return float(row[0]) + float(adjustments) if row else float(start) + float(adjustments)
 
 def start_of_day_balance(user_id):
     conn = db()
@@ -200,6 +194,86 @@ def missed_profit(d):
     extra = max(0.0, extra)
     return money_from_move(d["symbol"], d["lot"], extra)
 
+# -------------------- Navigation / UX helpers --------------------
+def nav_keyboard(include_back=True, include_restart=True):
+    rows=[]
+    if include_back and include_restart:
+        rows.append([InlineKeyboardButton("🔙 مرحله قبل", callback_data="nav_back"), InlineKeyboardButton("🔄 شروع مجدد", callback_data="nav_restart")])
+    elif include_back:
+        rows.append([InlineKeyboardButton("🔙 مرحله قبل", callback_data="nav_back")])
+    elif include_restart:
+        rows.append([InlineKeyboardButton("🔄 شروع مجدد", callback_data="nav_restart")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+def merge_inline(base_buttons, context):
+    rows=[list(r) for r in base_buttons]
+    rows.append([InlineKeyboardButton("🔙 مرحله قبل", callback_data="nav_back"), InlineKeyboardButton("🔄 شروع مجدد", callback_data="nav_restart")])
+    return InlineKeyboardMarkup(rows)
+
+async def restart_trade(update, context):
+    context.user_data.clear()
+    context.user_data["checks"]=[]
+    context.user_data["check_idx"]=0
+    if update.callback_query:
+        q=update.callback_query
+        await q.answer("ثبت معامله از اول شروع شد.")
+        await q.message.reply_text("🔄 از اول شروع کنیم. نماد رو انتخاب کن:", reply_markup=symbol_keyboard())
+    else:
+        await update.message.reply_text("🔄 از اول شروع کنیم. نماد رو انتخاب کن:", reply_markup=symbol_keyboard())
+    return SYMBOL
+
+async def nav_callback(update, context):
+    q=update.callback_query
+    await q.answer()
+    if q.data=="nav_restart":
+        return await restart_trade(update, context)
+    state=context.user_data.get("flow_state")
+    if state==SYMBOL:
+        await q.message.reply_text("🔙 به منوی اصلی برگشتیم.", reply_markup=main_keyboard())
+        context.user_data.clear(); return ConversationHandler.END
+    prompts={
+        SIDE:("📍 جهت معامله رو انتخاب کن:",side_keyboard(),SIDE),
+        ENTRY:("🎯 نقطه ورود رو وارد کن:",None,ENTRY),
+        SL:("🛑 Stop Loss رو وارد کن:",None,SL),
+        TP:("🎯 Take Profit رو وارد کن:",None,TP),
+        LOT:("📦 حجم معامله رو انتخاب کن:",volume_keyboard(),LOT),
+        RESULT:("نتیجه معامله رو انتخاب کن:",None,RESULT),
+        EXIT_PRICE:("🎯 نقطه خروج واقعی رو وارد کن:",None,EXIT_PRICE),
+        FINAL_MOVE:("🚀 Final Move رو وارد کن:",None,FINAL_MOVE),
+        SCREENSHOT:("📸 اسکرین‌شات معامله رو داری؟",ReplyKeyboardMarkup([["📸 آپلود عکس","🚫 عکس ندارم"]],resize_keyboard=True,one_time_keyboard=True),SCREENSHOT),
+    }
+    if state==CHECKLIST_START:
+        stage=context.user_data.get("stage_idx",0)
+        if stage>0:
+            context.user_data["stage_idx"]=stage-1
+            await ask_stage(q.message.chat_id,context,stage-1,message=q.message)
+        else:
+            await q.message.reply_text("🔙 برگشت به حجم معامله:",reply_markup=volume_keyboard())
+            context.user_data["flow_state"]=LOT
+            return LOT
+        return CHECKLIST_START
+    if state==RESULT:
+        await ask_stage(q.message.chat_id,context,len(CHECKLIST)-1,message=q.message)
+        context.user_data["stage_idx"]=len(CHECKLIST)-1
+        return CHECKLIST_START
+    prev={EXIT_PRICE:RESULT,FINAL_MOVE:EXIT_PRICE,SCREENSHOT:FINAL_MOVE}
+    target=prev.get(state)
+    if target:
+        context.user_data["flow_state"]=target
+        if target==RESULT:
+            await q.message.reply_text("🔙 نتیجه معامله رو انتخاب کن:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟢 WIN",callback_data="result_WIN"),InlineKeyboardButton("🔴 LOSS",callback_data="result_LOSS"),InlineKeyboardButton("➖ BE",callback_data="result_BE")],[InlineKeyboardButton("🔙 مرحله قبل",callback_data="nav_back"),InlineKeyboardButton("🔄 شروع مجدد",callback_data="nav_restart")]]))
+        elif target==EXIT_PRICE:
+            await q.message.reply_text("🎯 نقطه خروج واقعی رو وارد کن:",reply_markup=nav_keyboard())
+        elif target==FINAL_MOVE:
+            await q.message.reply_text("🚀 Final Move رو وارد کن:",reply_markup=nav_keyboard())
+        return target
+    if state in prompts:
+        text,kb,target=prompts[state]
+        await q.message.reply_text(text,reply_markup=kb)
+        context.user_data["flow_state"]=target
+        return target
+    return state
+
 # -------------------- UI --------------------
 def main_keyboard():
     return ReplyKeyboardMarkup(
@@ -207,8 +281,8 @@ def main_keyboard():
             ["📝 معامله جدید", "📊 داشبورد"],
             ["📅 امروز", "📈 هفته", "🗓 ماه"],
             ["📋 تحلیل چک‌لیست", "🏆 رکوردها"],
-            ["💰 مدیریت سرمایه", "⚙️ تنظیمات"],
-            ["🔎 نمادها"],
+            ["💰 مدیریت سرمایه", "🔎 نمادها"],
+            ["⚙️ تنظیمات"],
         ],
         resize_keyboard=True
     )
@@ -291,6 +365,7 @@ async def symbol(update, context):
         await update.message.reply_text("یکی از گزینه‌ها رو انتخاب کن.")
         return SYMBOL
     await update.message.reply_text("📍 جهت معامله رو انتخاب کن:", reply_markup=side_keyboard())
+    context.user_data["flow_state"]=SIDE
     return SIDE
 
 async def other_symbol(update, context):
@@ -311,7 +386,8 @@ async def side(update, context):
     else:
         await update.message.reply_text("BUY یا SELL رو انتخاب کن.")
         return SIDE
-    await update.message.reply_text("🎯 نقطه ورود رو وارد کن:")
+    await update.message.reply_text("🎯 نقطه ورود رو وارد کن:", reply_markup=nav_keyboard())
+    context.user_data["flow_state"]=ENTRY
     return ENTRY
 
 async def number_field(update, context, key, prompt, state):
@@ -321,7 +397,8 @@ async def number_field(update, context, key, prompt, state):
         await update.message.reply_text("لطفاً فقط عدد وارد کن.")
         return state
     context.user_data[key] = v
-    await update.message.reply_text(prompt)
+    await update.message.reply_text(prompt, reply_markup=nav_keyboard())
+    context.user_data["flow_state"]=state+1
     return state + 1
 
 async def entry(update, context):
@@ -331,16 +408,10 @@ async def sl(update, context):
     return await number_field(update, context, "sl", "🎯 Take Profit رو وارد کن:", SL)
 
 async def tp(update, context):
-    try:
-        v = float(update.message.text.replace(",", "."))
-    except ValueError:
-        await update.message.reply_text("لطفاً فقط عدد وارد کن.")
-        return TP
-    context.user_data["tp"] = v
     await update.message.reply_text(
-        "📦 حجم معامله رو انتخاب کن:",
-        reply_markup=volume_keyboard()
+        "📦 حجم معامله رو انتخاب کن:", reply_markup=volume_keyboard()
     )
+    context.user_data["flow_state"]=LOT
     return LOT
 
 async def lot(update, context):
@@ -353,59 +424,69 @@ async def lot(update, context):
         return LOT
     context.user_data["lot"] = v
     context.user_data["planned_rr"] = planned_rr(context.user_data)
-    # Explicitly reset checklist cursor here so the first checklist callback
-    # is always handled by the checklist state.
-    context.user_data["check_idx"] = 0
-    context.user_data["checks"] = []
     await update.message.reply_text(
         f"📐 R:R برنامه‌ریزی‌شده: <b>1:{context.user_data['planned_rr']:.2f}</b>\n\n"
         "حالا چک‌لیست ۶ مرحله‌ای رو بررسی کنیم ☑️",
         parse_mode="HTML", reply_markup=ReplyKeyboardRemove()
     )
+    context.user_data["stage_idx"]=0
     await ask_check(update, context)
+    context.user_data["flow_state"]=CHECKLIST_START
     return CHECKLIST_START
 
-async def ask_check(update, context):
-    i = context.user_data["check_idx"]
-    section, question = CHECK_ITEMS[i]
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("☑️ هست", callback_data="check_yes"),
-        InlineKeyboardButton("⬜ نیست", callback_data="check_no"),
-    ]])
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"<b>{section}</b>\n\n{question}",
-        parse_mode="HTML", reply_markup=keyboard
-    )
+def stage_item_indices(stage_idx):
+    start=sum(len(CHECKLIST[i][1]) for i in range(stage_idx))
+    return list(range(start,start+len(CHECKLIST[stage_idx][1])))
 
-async def checklist_button(update, context):
-    q = update.callback_query
-    await q.answer()
-    if q.data not in ("check_yes","check_no"):
-        return CHECKLIST_START
-    context.user_data["checks"].append(q.data == "check_yes")
-    context.user_data["check_idx"] += 1
-    try:
-        await q.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    if context.user_data["check_idx"] < TOTAL_CHECKS:
-        await ask_check(update, context)
-        return CHECKLIST_START
+def stage_keyboard(context, stage_idx):
+    checks=context.user_data.setdefault("checks",[False]*TOTAL_CHECKS)
+    rows=[]
+    for local,q in enumerate(CHECKLIST[stage_idx][1]):
+        gi=stage_item_indices(stage_idx)[local]
+        mark="☑️" if checks[gi] else "⬜"
+        rows.append([InlineKeyboardButton(f"{mark} {q}",callback_data=f"toggle_{gi}")])
+    rows.append([InlineKeyboardButton(f"✅ ثبت مرحله {stage_idx+1}",callback_data=f"stage_done_{stage_idx}")])
+    rows.append([InlineKeyboardButton("🔙 مرحله قبل",callback_data="nav_back"),InlineKeyboardButton("🔄 شروع مجدد",callback_data="nav_restart")])
+    return InlineKeyboardMarkup(rows)
 
-    score = sum(context.user_data["checks"])
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"✅ چک‌لیست کامل شد: <b>{score}/{TOTAL_CHECKS}</b> "
-             f"({pct(score,TOTAL_CHECKS):.1f}%)\n\nنتیجه معامله رو انتخاب کن:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🟢 WIN", callback_data="result_WIN"),
-            InlineKeyboardButton("🔴 LOSS", callback_data="result_LOSS"),
-            InlineKeyboardButton("➖ BE", callback_data="result_BE"),
-        ]])
-    )
-    return RESULT
+async def ask_stage(chat_id,context,stage_idx,message=None):
+    section,_=CHECKLIST[stage_idx]
+    checks=context.user_data.setdefault("checks",[False]*TOTAL_CHECKS)
+    inds=stage_item_indices(stage_idx)
+    selected=sum(checks[i] for i in inds)
+    text=f"<b>{section}</b>\n\nهر موردی که برقرار است را تیک بزن. ☑️\nانتخاب‌شده: <b>{selected}/{len(inds)}</b>"
+    kb=stage_keyboard(context,stage_idx)
+    if message:
+        await message.edit_text(text,parse_mode="HTML",reply_markup=kb)
+    else:
+        await context.bot.send_message(chat_id=chat_id,text=text,parse_mode="HTML",reply_markup=kb)
+
+async def ask_check(update,context):
+    await ask_stage(update.effective_chat.id,context,context.user_data.get("stage_idx",0))
+
+async def checklist_button(update,context):
+    q=update.callback_query; await q.answer()
+    if q.data.startswith("toggle_"):
+        idx=int(q.data.split("_",1)[1]); checks=context.user_data.setdefault("checks",[False]*TOTAL_CHECKS)
+        checks[idx]=not checks[idx]
+        await ask_stage(q.message.chat_id,context,context.user_data.get("stage_idx",0),q.message)
+        return CHECKLIST_START
+    if q.data.startswith("stage_done_"):
+        done=int(q.data.rsplit("_",1)[1]); stage=context.user_data.get("stage_idx",0)
+        if done!=stage: return CHECKLIST_START
+        selected=sum(context.user_data["checks"][i] for i in stage_item_indices(done))
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        if done<len(CHECKLIST)-1:
+            await q.message.reply_text(f"✅ مرحله {done+1} ثبت شد — {selected}/{len(CHECKLIST[done][1])} مورد تأیید شد.")
+            context.user_data["stage_idx"]=done+1
+            await ask_stage(q.message.chat_id,context,done+1)
+            return CHECKLIST_START
+        total_selected=sum(context.user_data["checks"])
+        context.user_data["flow_state"]=RESULT
+        await q.message.reply_text(f"🏁 چک‌لیست کامل شد: <b>{total_selected}/{TOTAL_CHECKS}</b> ({pct(total_selected,TOTAL_CHECKS):.1f}%)\n\nنتیجه معامله رو انتخاب کن:",parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟢 WIN",callback_data="result_WIN"),InlineKeyboardButton("🔴 LOSS",callback_data="result_LOSS"),InlineKeyboardButton("➖ BE",callback_data="result_BE")],[InlineKeyboardButton("🔙 مرحله قبل",callback_data="nav_back"),InlineKeyboardButton("🔄 شروع مجدد",callback_data="nav_restart")]]))
+        return RESULT
+    return CHECKLIST_START
 
 async def result_callback(update, context):
     q = update.callback_query
@@ -439,6 +520,7 @@ async def exit_price(update, context):
         "در جهت معامله.",
         parse_mode="HTML"
     )
+    context.user_data["flow_state"]=FINAL_MOVE
     return FINAL_MOVE
 
 async def final_move(update, context):
@@ -459,6 +541,7 @@ async def final_move(update, context):
             resize_keyboard=True, one_time_keyboard=True
         )
     )
+    context.user_data["flow_state"]=SCREENSHOT
     return SCREENSHOT
 
 async def screenshot_choice(update, context):
@@ -655,7 +738,7 @@ def report_text(rows, title):
         f"🟢 WIN: <b>{wins}</b>\n"
         f"🔴 LOSS: <b>{losses}</b>\n"
         f"➖ BE: {be}\n"
-        f"🎯 Win Rate: <b>{pct(wins,total):.1f}%</b>\n"
+        f"🎯 Win Rate: <b>{fmt_pct(wins,total)}</b>\n"
         f"💰 Net P/L: <b>{pnl:+.2f}$</b>\n"
         f"📈 Profit: {profit:+.2f}$\n"
         f"📉 Loss: {loss:+.2f}$\n"
@@ -667,40 +750,26 @@ def report_text(rows, title):
     )
 
 def checklist_breakdown(rows):
-    wins = [r for r in rows if str(r[14]).upper() == "WIN"]
-    losses = [r for r in rows if str(r[14]).upper() == "LOSS"]
-    lines = ["📋 <b>تحلیل چک‌لیست — تفکیک WIN و LOSS</b>\n"]
-
-    for stage_idx, (section, questions) in enumerate(CHECKLIST):
+    wins=[r for r in rows if str(r[14]).strip().upper()=="WIN"]
+    losses=[r for r in rows if str(r[14]).strip().upper()=="LOSS"]
+    lines=["📋 <b>تحلیل چک‌لیست — تفکیک WIN و LOSS</b>"]
+    offset=0
+    for section,questions in CHECKLIST:
         lines.append(f"\n<b>{section}</b>")
-        start = sum(len(CHECKLIST[i][1]) for i in range(stage_idx))
-        for j, question in enumerate(questions):
-            idx = start + j
-            def rate(group):
-                if not group:
-                    return None
-                yes = sum(1 for r in group if len(r[12].split(",")) > idx and r[12].split(",")[idx] == "1")
-                return pct(yes, len(group))
-            wr, lr = rate(wins), rate(losses)
-            wtxt = "—" if wr is None else f"{wr:.0f}%"
-            ltxt = "—" if lr is None else f"{lr:.0f}%"
-            diff = "—" if wr is None or lr is None else f"{wr-lr:+.0f}%"
-            lines.append(f"• {question}\n  🟢 WIN: {wtxt} | 🔴 LOSS: {ltxt} | Δ: {diff}")
-    if not wins or not losses:
-        lines.append("\nℹ️ برای مقایسه واقعی WIN و LOSS حداقل یک مورد از هرکدام لازم است.")
-    else:
-        # Top differences
-        diffs = []
-        for idx, (_, question) in enumerate(CHECK_ITEMS):
-            wr = pct(sum(1 for r in wins if r[12].split(",")[idx]=="1"), len(wins))
-            lr = pct(sum(1 for r in losses if r[12].split(",")[idx]=="1"), len(losses))
-            diffs.append((wr-lr, question))
-        lines.append("\n💡 <b>بیشترین اختلاف WIN نسبت به LOSS:</b>")
-        for d,q in sorted(diffs, reverse=True)[:5]:
-            lines.append(f"• {d:+.0f}% — {q}")
-        lines.append("\n⚠️ <b>بیشترین ضعف در WIN نسبت به LOSS:</b>")
-        for d,q in sorted(diffs)[:5]:
-            lines.append(f"• {d:+.0f}% — {q}")
+        for question in questions:
+            def item_rate(group, want_checked):
+                if not group: return None
+                vals=[r[12].split(",") for r in group]
+                vals=[v for v in vals if len(v)>offset]
+                if not vals: return None
+                hits=sum((v[offset]=="1") == want_checked for v in vals)
+                return pct(hits,len(vals))
+            wr=item_rate(wins,True); lr=item_rate(losses,False)
+            wtxt="—" if wr is None else f"{wr:.0f}%"
+            ltxt="—" if lr is None else f"{lr:.0f}%"
+            lines.append(f"• {question}\n  🟢 در WIN تیک خورده: <b>{wtxt}</b> | 🔴 در LOSS تیک نخورده: <b>{ltxt}</b>")
+            offset+=1
+    if not wins or not losses: lines.append("\nℹ️ برای مقایسه کامل حداقل یک WIN و یک LOSS لازم است.")
     return "\n".join(lines)
 
 async def dashboard(update, context):
@@ -750,69 +819,33 @@ async def symbols(update, context):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def capital_menu(update, context):
-    await update.message.reply_text(
-        "💰 <b>مدیریت سرمایه</b>\n\n"
-        "واریز و برداشت سرمایه جدا از معاملات ثبت می‌شود و روی Win Rate و Profit Factor اثر نمی‌گذارد.",
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardMarkup(
-            [["➕ افزایش سرمایه", "➖ کاهش سرمایه"], ["📊 سرمایه فعلی", "↩️ بازگشت"]],
-            resize_keyboard=True, one_time_keyboard=True
-        )
-    )
+    await update.message.reply_text("💰 <b>مدیریت سرمایه</b>\n\nواریز و برداشت جدا از معاملات ثبت می‌شود و آمار معاملاتی را تغییر نمی‌دهد.",parse_mode="HTML",reply_markup=ReplyKeyboardMarkup([["➕ افزایش سرمایه","➖ کاهش سرمایه"],["📊 سرمایه فعلی","📜 تاریخچه"],["🔙 بازگشت"]],resize_keyboard=True))
 
-async def capital_adjustment(update, context):
-    t = update.message.text.strip()
-    if t == "📊 سرمایه فعلی":
-        bal = current_balance(update.effective_user.id)
-        await update.message.reply_text(
-            f"🏦 سرمایه فعلی: <b>${bal:.2f}</b>",
-            parse_mode="HTML", reply_markup=main_keyboard()
-        )
-        return
-    if t == "↩️ بازگشت":
-        await update.message.reply_text("برگشتیم به منوی اصلی 😎", reply_markup=main_keyboard())
-        return
-    if t == "➕ افزایش سرمایه":
-        context.user_data["capital_type"] = "DEPOSIT"
-        await update.message.reply_text("💵 مبلغ افزایش سرمایه رو وارد کن:")
-        return
-    if t == "➖ کاهش سرمایه":
-        context.user_data["capital_type"] = "WITHDRAW"
-        await update.message.reply_text("💵 مبلغ کاهش سرمایه رو وارد کن:")
-        return
-
-    if context.user_data.get("capital_type"):
-        try:
-            amount = float(t.replace(",", "."))
-            if amount <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("لطفاً یک مبلغ مثبت وارد کن؛ مثلاً 100")
-            return
-
-        uid = update.effective_user.id
-        typ = context.user_data["capital_type"]
-        conn = db()
-        conn.execute(
-            """INSERT INTO capital_adjustments
-               (user_id, created_at, adjustment_type, amount, note)
-               VALUES (?,?,?,?,?)""",
-            (uid, datetime.now().isoformat(timespec="seconds"), typ, amount, None)
-        )
-        conn.commit()
-        conn.close()
-        context.user_data.pop("capital_type", None)
-
-        bal = current_balance(uid)
-        label = "افزایش" if typ == "DEPOSIT" else "کاهش"
-        await update.message.reply_text(
-            f"✅ {label} سرمایه به مبلغ <b>${amount:.2f}</b> ثبت شد.\n\n"
-            f"🏦 سرمایه فعلی: <b>${bal:.2f}</b>\n"
-            "📊 این مورد به‌عنوان معامله حساب نمی‌شود و آمار معاملاتی را تغییر نمی‌دهد.",
-            parse_mode="HTML", reply_markup=main_keyboard()
-        )
-        return
-
+async def capital_action(update, context):
+    t=update.message.text.strip()
+    uid=update.effective_user.id
+    if t=="🔙 بازگشت":
+        context.user_data.pop("capital_mode",None); await update.message.reply_text("برگشتیم به منوی اصلی 😎",reply_markup=main_keyboard()); return
+    if t=="📊 سرمایه فعلی":
+        await update.message.reply_text(f"🏦 سرمایه فعلی: <b>${current_balance(uid):.2f}</b>",parse_mode="HTML",reply_markup=ReplyKeyboardMarkup([["🔙 بازگشت"]],resize_keyboard=True)); return
+    if t=="📜 تاریخچه":
+        conn=db(); rows=conn.execute("SELECT created_at,adjustment_type,amount,note FROM capital_adjustments WHERE user_id=? ORDER BY id DESC LIMIT 10",(uid,)).fetchall(); conn.close()
+        if not rows: text="📜 هنوز تغییر سرمایه‌ای ثبت نشده."
+        else:
+            lines=["📜 <b>تاریخچه تغییرات سرمایه</b>"]
+            for dt,typ,amt,note in rows: lines.append(f"{('➕' if typ=='DEPOSIT' else '➖')} ${amt:.2f} — {dt[:16]}")
+            text="\n".join(lines)
+        await update.message.reply_text(text,parse_mode="HTML",reply_markup=ReplyKeyboardMarkup([["🔙 بازگشت"]],resize_keyboard=True)); return
+    if t in ("➕ افزایش سرمایه","➖ کاهش سرمایه"):
+        context.user_data["capital_mode"]="DEPOSIT" if t.startswith("➕") else "WITHDRAW"
+        await update.message.reply_text("💵 مبلغ رو وارد کن:",reply_markup=ReplyKeyboardMarkup([["🔙 بازگشت"]],resize_keyboard=True)); return
+    if context.user_data.get("capital_mode"):
+        try: amount=float(t.replace(",",".")); assert amount>0
+        except: await update.message.reply_text("فقط یک مبلغ مثبت وارد کن؛ مثلاً 100"); return
+        typ=context.user_data.pop("capital_mode")
+        conn=db(); conn.execute("INSERT INTO capital_adjustments(user_id,created_at,adjustment_type,amount,note) VALUES(?,?,?,?,?)",(uid,datetime.now().isoformat(timespec="seconds"),typ,amount,None)); conn.commit(); conn.close()
+        sign="افزایش" if typ=="DEPOSIT" else "کاهش"
+        await update.message.reply_text(f"✅ {sign} سرمایه به مبلغ <b>${amount:.2f}</b> ثبت شد.\n🏦 سرمایه فعلی: <b>${current_balance(uid):.2f}</b>",parse_mode="HTML",reply_markup=main_keyboard()); return
     await update.message.reply_text("یکی از گزینه‌ها رو انتخاب کن.")
 
 async def settings(update, context):
@@ -838,29 +871,31 @@ def main():
     db()
     app = Application.builder().token(TOKEN).build()
 
+    nav_all = CallbackQueryHandler(nav_callback, pattern=r"^nav_(back|restart)$")
     states = {
-        BALANCE_SETUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_balance)],
-        SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, symbol)],
-        OTHER_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, other_symbol)],
-        SIDE: [MessageHandler(filters.TEXT & ~filters.COMMAND, side)],
-        ENTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, entry)],
-        SL: [MessageHandler(filters.TEXT & ~filters.COMMAND, sl)],
-        TP: [MessageHandler(filters.TEXT & ~filters.COMMAND, tp)],
-        LOT: [MessageHandler(filters.TEXT & ~filters.COMMAND, lot)],
+        SYMBOL: [nav_all, MessageHandler(filters.TEXT & ~filters.COMMAND, symbol)],
+        OTHER_SYMBOL: [nav_all, MessageHandler(filters.TEXT & ~filters.COMMAND, other_symbol)],
+        SIDE: [nav_all, MessageHandler(filters.TEXT & ~filters.COMMAND, side)],
+        ENTRY: [nav_all, MessageHandler(filters.TEXT & ~filters.COMMAND, entry)],
+        SL: [nav_all, MessageHandler(filters.TEXT & ~filters.COMMAND, sl)],
+        TP: [nav_all, MessageHandler(filters.TEXT & ~filters.COMMAND, tp)],
+        LOT: [nav_all, MessageHandler(filters.TEXT & ~filters.COMMAND, lot)],
+        CHECKLIST_START: [
+            CallbackQueryHandler(nav_callback, pattern=r"^nav_(back|restart)$"),
+            CallbackQueryHandler(checklist_button, pattern=r"^(toggle_\\d+|stage_done_\\d+)$")
+        ],
+        RESULT: [
+            CallbackQueryHandler(nav_callback, pattern=r"^nav_(back|restart)$"),
+            CallbackQueryHandler(result_callback, pattern=r"^result_(WIN|LOSS|BE)$")
+        ],
+        EXIT_PRICE: [nav_all, MessageHandler(filters.TEXT & ~filters.COMMAND, exit_price)],
+        FINAL_MOVE: [nav_all, MessageHandler(filters.TEXT & ~filters.COMMAND, final_move)],
+        SCREENSHOT: [
+            nav_all,
+            MessageHandler(filters.PHOTO, screenshot_photo),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, screenshot_choice),
+        ],
     }
-    # Keep the whole checklist in ONE conversation state. This avoids the
-    # Telegram ConversationHandler dropping the state after the first inline
-    # button press. The callback itself advances check_idx until completion.
-    states[CHECKLIST_START] = [
-        CallbackQueryHandler(checklist_button, pattern=r"^check_(yes|no)$")
-    ]
-    states[RESULT] = [CallbackQueryHandler(result_callback, pattern=r"^result_(WIN|LOSS|BE)$")]
-    states[EXIT_PRICE] = [MessageHandler(filters.TEXT & ~filters.COMMAND, exit_price)]
-    states[FINAL_MOVE] = [MessageHandler(filters.TEXT & ~filters.COMMAND, final_move)]
-    states[SCREENSHOT] = [
-        MessageHandler(filters.PHOTO, screenshot_photo),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, screenshot_choice),
-    ]
 
     conv = ConversationHandler(
         entry_points=[
@@ -888,21 +923,12 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^📋 تحلیل چک‌لیست$"), checklist_report))
     app.add_handler(MessageHandler(filters.Regex("^🏆 رکوردها$"), records))
     app.add_handler(MessageHandler(filters.Regex("^🔎 نمادها$"), symbols))
-    app.add_handler(MessageHandler(
-        filters.Regex("^(💰 مدیریت سرمایه|➕ افزایش سرمایه|➖ کاهش سرمایه|📊 سرمایه فعلی|↩️ بازگشت)$"),
-        capital_menu
-    ))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ تنظیمات$"), settings))
-    # Initial balance entry MUST come before the capital-adjustment handler,
-    # otherwise the numeric amount typed after /start gets swallowed.
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        setup_balance
-    ))
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.Regex(r"^(?:\d+(?:[\.,]\d+)?|➕ افزایش سرمایه|➖ کاهش سرمایه|📊 سرمایه فعلی|↩️ بازگشت)$"),
-        capital_adjustment
-    ))
+    app.add_handler(MessageHandler(filters.Regex("^💰 مدیریت سرمایه$"), capital_menu))
+    app.add_handler(MessageHandler(filters.Regex("^(?:➕ افزایش سرمایه|➖ کاهش سرمایه|📊 سرمایه فعلی|📜 تاریخچه|🔙 بازگشت)$"), capital_action))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r"^\d+(?:[\.,]\d+)?$"), capital_action))
+    # Initial balance entry when explicitly requested.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, setup_balance))
 
     port = int(os.getenv("PORT","10000"))
     external = os.getenv("RENDER_EXTERNAL_URL","").rstrip("/")
