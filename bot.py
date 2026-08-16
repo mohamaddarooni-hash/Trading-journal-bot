@@ -327,6 +327,10 @@ async def lot(update, context):
         return LOT
     context.user_data["lot"] = v
     context.user_data["planned_rr"] = planned_rr(context.user_data)
+    # Explicitly reset checklist cursor here so the first checklist callback
+    # is always handled by the checklist state.
+    context.user_data["check_idx"] = 0
+    context.user_data["checks"] = []
     await update.message.reply_text(
         f"📐 R:R برنامه‌ریزی‌شده: <b>1:{context.user_data['planned_rr']:.2f}</b>\n\n"
         "حالا چک‌لیست ۶ مرحله‌ای رو بررسی کنیم ☑️",
@@ -352,7 +356,7 @@ async def checklist_button(update, context):
     q = update.callback_query
     await q.answer()
     if q.data not in ("check_yes","check_no"):
-        return CHECKLIST_START + context.user_data.get("check_idx",0)
+        return CHECKLIST_START
     context.user_data["checks"].append(q.data == "check_yes")
     context.user_data["check_idx"] += 1
     try:
@@ -361,7 +365,7 @@ async def checklist_button(update, context):
         pass
     if context.user_data["check_idx"] < TOTAL_CHECKS:
         await ask_check(update, context)
-        return CHECKLIST_START + context.user_data["check_idx"]
+        return CHECKLIST_START
 
     score = sum(context.user_data["checks"])
     await context.bot.send_message(
@@ -752,10 +756,12 @@ def main():
         TP: [MessageHandler(filters.TEXT & ~filters.COMMAND, tp)],
         LOT: [MessageHandler(filters.TEXT & ~filters.COMMAND, lot)],
     }
-    for i in range(TOTAL_CHECKS):
-        states[CHECKLIST_START+i] = [
-            CallbackQueryHandler(checklist_button, pattern=r"^check_(yes|no)$")
-        ]
+    # Keep the whole checklist in ONE conversation state. This avoids the
+    # Telegram ConversationHandler dropping the state after the first inline
+    # button press. The callback itself advances check_idx until completion.
+    states[CHECKLIST_START] = [
+        CallbackQueryHandler(checklist_button, pattern=r"^check_(yes|no)$")
+    ]
     states[RESULT] = [CallbackQueryHandler(result_callback, pattern=r"^result_(WIN|LOSS|BE)$")]
     states[EXIT_PRICE] = [MessageHandler(filters.TEXT & ~filters.COMMAND, exit_price)]
     states[FINAL_MOVE] = [MessageHandler(filters.TEXT & ~filters.COMMAND, final_move)]
