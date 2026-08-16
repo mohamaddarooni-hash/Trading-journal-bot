@@ -18,10 +18,10 @@ VERSION = "2026-08-16-pro-v3"
 # -------------------- Conversation states --------------------
 BALANCE_SETUP, SYMBOL, OTHER_SYMBOL, SIDE, ENTRY, SL, TP, LOT = range(8)
 CHECKLIST_START = 8
-RESULT = CHECKLIST_START + 18
-EXIT_PRICE = RESULT + 1
-FINAL_MOVE = EXIT_PRICE + 1
-SCREENSHOT = FINAL_MOVE + 1
+RESULT = 9
+EXIT_PRICE = 10
+FINAL_MOVE = 11
+SCREENSHOT = 12
 
 # -------------------- Exact 6-stage checklist --------------------
 CHECKLIST = [
@@ -68,6 +68,16 @@ def db():
         user_id INTEGER PRIMARY KEY,
         initial_balance REAL NOT NULL,
         created_at TEXT NOT NULL
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS capital_adjustments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        adjustment_type TEXT NOT NULL,
+        amount REAL NOT NULL,
+        note TEXT
     )
     """)
     conn.execute("""
@@ -124,14 +134,22 @@ def set_initial_balance(user_id, value):
 
 def current_balance(user_id):
     start = initial_balance(user_id)
+    if start is None:
+        return None
     conn = db()
-    row = conn.execute("""
-        SELECT balance_after FROM trades
-        WHERE user_id=? AND balance_after IS NOT NULL
-        ORDER BY id DESC LIMIT 1
-    """, (user_id,)).fetchone()
+    trade_pnl = conn.execute(
+        "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE user_id=?", (user_id,)
+    ).fetchone()[0]
+    adjustments = conn.execute(
+        """SELECT COALESCE(SUM(
+               CASE WHEN adjustment_type='DEPOSIT' THEN amount
+                    WHEN adjustment_type='WITHDRAW' THEN -amount
+                    ELSE 0 END
+             ),0)
+           FROM capital_adjustments WHERE user_id=?""", (user_id,)
+    ).fetchone()[0]
     conn.close()
-    return float(row[0]) if row else start
+    return float(start) + float(trade_pnl or 0) + float(adjustments or 0)
 
 def start_of_day_balance(user_id):
     conn = db()
@@ -189,7 +207,8 @@ def main_keyboard():
             ["📝 معامله جدید", "📊 داشبورد"],
             ["📅 امروز", "📈 هفته", "🗓 ماه"],
             ["📋 تحلیل چک‌لیست", "🏆 رکوردها"],
-            ["🔎 نمادها", "⚙️ تنظیمات"],
+            ["💰 مدیریت سرمایه", "⚙️ تنظیمات"],
+            ["🔎 نمادها"],
         ],
         resize_keyboard=True
     )
@@ -312,8 +331,15 @@ async def sl(update, context):
     return await number_field(update, context, "sl", "🎯 Take Profit رو وارد کن:", SL)
 
 async def tp(update, context):
+    try:
+        v = float(update.message.text.replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("لطفاً فقط عدد وارد کن.")
+        return TP
+    context.user_data["tp"] = v
     await update.message.reply_text(
-        "📦 حجم معامله رو انتخاب کن:", reply_markup=volume_keyboard()
+        "📦 حجم معامله رو انتخاب کن:",
+        reply_markup=volume_keyboard()
     )
     return LOT
 
@@ -723,6 +749,72 @@ async def symbols(update, context):
         lines.append(f"<b>{s}</b> — {t} معامله | Win Rate {pct(w,t):.1f}% | P/L {p:+.2f}$")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+async def capital_menu(update, context):
+    await update.message.reply_text(
+        "💰 <b>مدیریت سرمایه</b>\n\n"
+        "واریز و برداشت سرمایه جدا از معاملات ثبت می‌شود و روی Win Rate و Profit Factor اثر نمی‌گذارد.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(
+            [["➕ افزایش سرمایه", "➖ کاهش سرمایه"], ["📊 سرمایه فعلی", "↩️ بازگشت"]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
+    )
+
+async def capital_adjustment(update, context):
+    t = update.message.text.strip()
+    if t == "📊 سرمایه فعلی":
+        bal = current_balance(update.effective_user.id)
+        await update.message.reply_text(
+            f"🏦 سرمایه فعلی: <b>${bal:.2f}</b>",
+            parse_mode="HTML", reply_markup=main_keyboard()
+        )
+        return
+    if t == "↩️ بازگشت":
+        await update.message.reply_text("برگشتیم به منوی اصلی 😎", reply_markup=main_keyboard())
+        return
+    if t == "➕ افزایش سرمایه":
+        context.user_data["capital_type"] = "DEPOSIT"
+        await update.message.reply_text("💵 مبلغ افزایش سرمایه رو وارد کن:")
+        return
+    if t == "➖ کاهش سرمایه":
+        context.user_data["capital_type"] = "WITHDRAW"
+        await update.message.reply_text("💵 مبلغ کاهش سرمایه رو وارد کن:")
+        return
+
+    if context.user_data.get("capital_type"):
+        try:
+            amount = float(t.replace(",", "."))
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("لطفاً یک مبلغ مثبت وارد کن؛ مثلاً 100")
+            return
+
+        uid = update.effective_user.id
+        typ = context.user_data["capital_type"]
+        conn = db()
+        conn.execute(
+            """INSERT INTO capital_adjustments
+               (user_id, created_at, adjustment_type, amount, note)
+               VALUES (?,?,?,?,?)""",
+            (uid, datetime.now().isoformat(timespec="seconds"), typ, amount, None)
+        )
+        conn.commit()
+        conn.close()
+        context.user_data.pop("capital_type", None)
+
+        bal = current_balance(uid)
+        label = "افزایش" if typ == "DEPOSIT" else "کاهش"
+        await update.message.reply_text(
+            f"✅ {label} سرمایه به مبلغ <b>${amount:.2f}</b> ثبت شد.\n\n"
+            f"🏦 سرمایه فعلی: <b>${bal:.2f}</b>\n"
+            "📊 این مورد به‌عنوان معامله حساب نمی‌شود و آمار معاملاتی را تغییر نمی‌دهد.",
+            parse_mode="HTML", reply_markup=main_keyboard()
+        )
+        return
+
+    await update.message.reply_text("یکی از گزینه‌ها رو انتخاب کن.")
+
 async def settings(update, context):
     bal = initial_balance(update.effective_user.id)
     await update.message.reply_text(
@@ -796,7 +888,15 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^📋 تحلیل چک‌لیست$"), checklist_report))
     app.add_handler(MessageHandler(filters.Regex("^🏆 رکوردها$"), records))
     app.add_handler(MessageHandler(filters.Regex("^🔎 نمادها$"), symbols))
+    app.add_handler(MessageHandler(
+        filters.Regex("^(💰 مدیریت سرمایه|➕ افزایش سرمایه|➖ کاهش سرمایه|📊 سرمایه فعلی|↩️ بازگشت)$"),
+        capital_menu
+    ))
     app.add_handler(MessageHandler(filters.Regex("^⚙️ تنظیمات$"), settings))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(r"^(?:\d+(?:[\.,]\d+)?|➕ افزایش سرمایه|➖ کاهش سرمایه|📊 سرمایه فعلی|↩️ بازگشت)$"),
+        capital_adjustment
+    ))
     # Initial balance entry when explicitly requested.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, setup_balance))
 
