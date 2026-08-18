@@ -1,3 +1,5 @@
-# Trading Journal Pro V4
-
-اصلاحات: دکمه برگشت و شروع مجدد در مراحل ثبت، چک‌لیست مرحله‌ای با همه ریزآیتم‌ها، مدیریت سرمایه کامل، و گزارش چک‌لیست با WIN=تیک خورده و LOSS=تیک نخورده.
+Trading Journal Pro V4.2
+Built from supplied V4.1 source.
+AST parse: OK
+py_compile: OK
+Checklist callback/initialization fixes applied.
